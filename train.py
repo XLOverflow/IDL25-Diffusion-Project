@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4, help="per gpu batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="batch size")
     parser.add_argument("--num_classes", type=int, default=100, help="number of classes in dataset")
+    parser.add_argument("--train_subset_size", type=int, default=None, help="limit the number of training samples for quick experiments")
 
     # training
     parser.add_argument("--run_name", type=str, default=None, help="run_name")
@@ -45,6 +46,7 @@ def parse_args():
     parser.add_argument("--grad_clip", type=float, default=1.0, help="gradient clip")
     parser.add_argument("--seed", type=int, default=42, help="random seed")
     parser.add_argument("--mixed_precision", type=str, default='none', choices=['fp16', 'bf16', 'fp32', 'none'], help='mixed precision')
+    parser.add_argument("--limit_train_steps", type=int, default=None, help="stop training after this many optimization steps for quick runs")
     
     # ddpm
     parser.add_argument("--num_train_timesteps", type=int, default=1000, help="ddpm training timesteps")
@@ -124,19 +126,38 @@ def main():
     logger.info("Creating dataset")
     # TODO: use transform to normalize your images to [-1, 1]
     # TODO: you can also use horizontal flip
-    transform = None 
+    transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
     # TOOD: use image folder for your train dataset
-    train_dataset = None 
+    train_dataset = datasets.ImageFolder(args.data_dir, transform=transform)
+    if args.train_subset_size is not None and args.train_subset_size < len(train_dataset):
+        generator = torch.Generator().manual_seed(args.seed)
+        indices = torch.randperm(len(train_dataset), generator=generator)[:args.train_subset_size]
+        train_dataset = torch.utils.data.Subset(train_dataset, indices.tolist())
     
     # TODO: setup dataloader
     sampler = None 
     if args.distributed:
         # TODO: distributed sampler
-        sampler =None 
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True
+        )
     # TODO: shuffle
     shuffle = False if sampler else True
     # TODO dataloader
-    train_loader = None 
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
     
     # calculate total batch_size
     total_batch_size = args.batch_size * args.world_size 
@@ -163,7 +184,17 @@ def main():
     logger.info(f"Number of parameters: {num_params / 10 ** 6:.2f}M")
     
     # TODO: ddpm shceduler
-    scheduler = DDPMScheduler(None)
+    scheduler = DDPMScheduler(
+        num_train_timesteps=args.num_train_timesteps,
+        num_inference_steps=args.num_inference_steps,
+        beta_start=args.beta_start,
+        beta_end=args.beta_end,
+        beta_schedule=args.beta_schedule,
+        variance_type=args.variance_type,
+        prediction_type=args.prediction_type,
+        clip_sample=args.clip_sample,
+        clip_sample_range=args.clip_sample_range,
+    )
     
     # NOTE: this is for latent DDPM 
     vae = None
@@ -177,7 +208,7 @@ def main():
     class_embedder = None
     if args.use_cfg:
         # TODO: 
-        class_embedder = ClassEmbedder(None)
+        class_embedder = ClassEmbedder(embed_dim=args.unet_ch, n_classes=args.num_classes, cond_drop_rate=0.1)
         
     # send to device
     unet = unet.to(device)
@@ -188,13 +219,19 @@ def main():
         class_embedder = class_embedder.to(device)
     
     # TODO: setup optimizer
-    optimizer = None 
+    trainable_params = list(unet.parameters())
+    if class_embedder:
+        trainable_params += list(class_embedder.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
     # TODO: setup scheduler
-    scheduler = None 
-    
-    # max train steps
     num_update_steps_per_epoch = len(train_loader)
+    if num_update_steps_per_epoch == 0:
+        raise ValueError("train_loader is empty. Please check dataset and subset settings.")
     args.max_train_steps = args.num_epochs * num_update_steps_per_epoch
+    if args.limit_train_steps is not None:
+        args.max_train_steps = min(args.max_train_steps, args.limit_train_steps)
+    total_training_steps = max(1, args.max_train_steps)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_training_steps)
     
     #  setup distributed training
     if args.distributed:
@@ -211,13 +248,23 @@ def main():
     vae_wo_ddp = vae
     # TODO: setup ddim
     if args.use_ddim:
-        scheduler_wo_ddp = DDIMScheduler(None)
+        scheduler_wo_ddp = DDIMScheduler(
+            num_train_timesteps=args.num_train_timesteps,
+            num_inference_steps=args.num_inference_steps,
+            beta_start=args.beta_start,
+            beta_end=args.beta_end,
+            beta_schedule=args.beta_schedule,
+            variance_type=args.variance_type,
+            prediction_type=args.prediction_type,
+            clip_sample=args.clip_sample,
+            clip_sample_range=args.clip_sample_range,
+        ).to(device)
     else:
         scheduler_wo_ddp = scheduler
     
     # TODO: setup evaluation pipeline
     # NOTE: this pipeline is not differentiable and only for evaluatin
-    pipeline = DDPMPipeline(None)
+    pipeline = DDPMPipeline(unet_wo_ddp, scheduler_wo_ddp, vae=vae_wo_ddp, class_embedder=class_embedder_wo_ddp)
     
     
     # dump config file
@@ -247,6 +294,8 @@ def main():
         logger.info(f"  Total optimization steps per epoch {num_update_steps_per_epoch}")
         logger.info(f"  Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
+    global_step = 0
+    stop_training = False
     progress_bar = tqdm(range(args.max_train_steps), disable=not is_primary(args))
 
     # training
@@ -264,55 +313,56 @@ def main():
         loss_m = AverageMeter()
         
         # TODO: set unet and scheduelr to train
-        unet
-        scheduler 
+        unet.train()
+        scheduler.train()
         
         
         # TODO: finish this
-        for step, (None, labels) in enumerate(train_loader):
+        for step, (images, labels) in enumerate(train_loader):
             
             batch_size = images.size(0)
             
             # TODO: send to device
-            images = None 
-            labels = None 
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
             
             # NOTE: this is for latent DDPM 
             if vae is not None:
                 # use vae to encode images as latents
-                images = None 
+                images = vae.encode(images)
                 # NOTE: do not change  this line, this is to ensure the latent has unit std
                 images = images * 0.1845
             
             # TODO: zero grad optimizer
+            optimizer.zero_grad(set_to_none=True)
             
             
             # NOTE: this is for CFG
             if class_embedder is not None:
                 # TODO: use class embedder to get class embeddings
-                class_emb = None 
+                class_emb = class_embedder(labels)
             else:
                 # NOTE: if not cfg, set class_emb to None
                 class_emb = None
             
             # TODO: sample noise 
-            noise = None  
+            noise = torch.randn_like(images)
             
             # TODO: sample timestep t
-            timesteps = None 
+            timesteps = torch.randint(0, args.num_train_timesteps, (batch_size,), device=device, dtype=torch.long)
             
             # TODO: add noise to images using scheduler
-            noisy_images = None 
+            noisy_images = scheduler.add_noise(images, noise, timesteps)
             
             # TODO: model prediction
-            model_pred = None 
+            model_pred = unet(noisy_images, timesteps, c=class_emb)
             
             if args.prediction_type == 'epsilon':
                 target = noise 
             
             # TODO: calculate loss
-            loss = None 
+            loss = F.mse_loss(model_pred, target)
             
             # record loss
             loss_m.update(loss.item())
@@ -321,12 +371,20 @@ def main():
             loss.backward()
             # TODO: grad clip
             if args.grad_clip:
-                pass 
+                torch.nn.utils.clip_grad_norm_(
+                    [p for group in optimizer.param_groups for p in group['params']],
+                    args.grad_clip,
+                )
             
             # TODO: step your optimizer
-            optimizer
+            optimizer.step()
+            lr_scheduler.step()
             
             progress_bar.update(1)
+            global_step += 1
+            if global_step >= args.max_train_steps:
+                stop_training = True
+                break
             
             # logger
             if step % 100 == 0 and is_primary(args):
@@ -344,10 +402,22 @@ def main():
             # random sample 4 classes
             classes = torch.randint(0, args.num_classes, (4,), device=device)
             # TODO: fill pipeline
-            gen_images = pipeline(None) 
+            gen_images = pipeline(
+                batch_size=4,
+                num_inference_steps=args.num_inference_steps,
+                classes=classes,
+                guidance_scale=args.cfg_guidance_scale,
+                generator=generator,
+                device=device,
+            ) 
         else:
             # TODO: fill pipeline
-            gen_images = pipeline(None) 
+            gen_images = pipeline(
+                batch_size=4,
+                num_inference_steps=args.num_inference_steps,
+                generator=generator,
+                device=device,
+            ) 
             
         # create a blank canvas for the grid
         grid_image = Image.new('RGB', (4 * args.image_size, 1 * args.image_size))
@@ -364,6 +434,9 @@ def main():
         # save checkpoint
         if is_primary(args):
             save_checkpoint(unet_wo_ddp, scheduler_wo_ddp, vae_wo_ddp, class_embedder, optimizer, epoch, save_dir=save_dir)
+
+        if stop_training:
+            break
 
 
 if __name__ == '__main__':
