@@ -178,7 +178,8 @@ def main():
     # TODO: using torchmetrics for evaluation, check the documents of torchmetrics
     import torchmetrics 
     
-    from torchmetrics.image.fid import FrechetInceptionDistance, InceptionScore
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    from torchmetrics.image.inception import InceptionScore
     
     # TODO: compute FID and IS
     fid = FrechetInceptionDistance(normalize=True).to(device)

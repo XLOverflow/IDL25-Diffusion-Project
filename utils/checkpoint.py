@@ -4,20 +4,21 @@ import os
 def load_checkpoint(unet, scheduler, vae=None, class_embedder=None, optimizer=None, checkpoint_path='checkpoints/checkpoint.pth'):
     
     print("loading checkpoint")
-    checkpoint = torch.load(checkpoint_path)
-    
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+
     print("loading unet")
     unet.load_state_dict(checkpoint['unet_state_dict'])
-    print("loading scheduler")
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        print("skip loading scheduler state_dict; reinitialize from current config")
     
     if vae is not None and 'vae_state_dict' in checkpoint:
         print("loading vae")
-        vae.load_state_dict(checkpoint['vae_state_dict'])
+        vae.load_state_dict(checkpoint['vae_state_dict'], strict=True)
     
     if class_embedder is not None and 'class_embedder_state_dict' in checkpoint:
         print("loading class_embedder")
-        class_embedder.load_state_dict(checkpoint['class_embedder_state_dict'])
+        class_embedder.load_state_dict(checkpoint['class_embedder_state_dict'], strict=True)
     
     
         
